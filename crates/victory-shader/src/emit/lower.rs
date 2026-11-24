@@ -454,9 +454,9 @@ impl<'a> Lower<'a> {
                 (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || reads_mask_as_data(x.st, i)
             };
-            let reads_whole = insts().any(whole);
+            let reads_mask_data = insts().any(|i| reads_mask_as_data(x.st, i));
+            let reads_whole = reads_mask_data || insts().any(whole);
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -596,6 +596,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            wants_console_flow |= x.target.runs(wave) && reads_mask_data;
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.

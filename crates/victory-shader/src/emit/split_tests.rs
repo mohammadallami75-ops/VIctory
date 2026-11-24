@@ -1273,3 +1273,166 @@ fn loops_leave_on_the_new_exec_of_saveexec() {
     ];
     console_flow_case("a loop leaving on saveexec's SCC", &body, 64, |_| 64);
 }
+
+// Scalar-state regressions adapted from the GFX10 fixtures in PR #269.
+#[test]
+fn loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("loop_exit_mask_counted_after_the_loop", &body, 64, |_| 64);
+}
+
+#[test]
+#[ignore = "requires scalar-state console-flow detection"]
+fn scalar_counted_in_a_divergent_loop_read_after_it() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x8109_8109, // loop: s_add_u32 s9, s9, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case(
+        "scalar_counted_in_a_divergent_loop_read_after_it",
+        &body,
+        64,
+        |_| 64,
+    );
+}
+
+#[test]
+fn mask_grown_inside_a_branch_counted_after_it() {
+    let body = [
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0      (lanes 0-15)
+        0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0      (lanes 32-63)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0      (of those: 32-47)
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x88FE_0C7E, // join: s_or_b64 exec, exec, s[12:13]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case(
+        "mask_grown_inside_a_branch_counted_after_it",
+        &body,
+        64,
+        |_| 32,
+    );
+}
+
+#[test]
+#[ignore = "requires scalar-state console-flow detection"]
+fn scalar_counted_in_nested_divergent_loops() {
+    let body = [
+        0x3602_0083, // v_and_b32 v1, 3, v0          outer count - 1
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x2C08_0084, // v_lshrrev_b32 v4, 4, v0      inner count - 1
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE8C_0480, // outer: s_mov_b64 s[12:13], 0
+        0x7E0A_0304, // v_mov_b32 v5, v4
+        0x8109_8109, // inner: s_add_i32 s9, s9, 1
+        0x4E0A_0A81, // v_subrev_nc_u32 v5, 1, v5
+        0x7D84_0A80, // v_cmp_eq_u32 vcc, 0, v5
+        0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+        0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+        0xBF89_FFFA, // s_cbranch_execnz inner
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF2, // s_cbranch_execnz outer
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case(
+        "scalar_counted_in_nested_divergent_loops",
+        &body,
+        64,
+        |_| 16,
+    );
+}
+
+const DISJOINT_SCALAR_UPDATES: &[u32] = &[
+    0xBE89_0381, // s_mov_b32 s9, 1
+    0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF88_0001, // s_cbranch_execz -> first restore
+    0x8109_8409, // s_add_u32 s9, s9, 4
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF88_0001, // s_cbranch_execz -> second restore
+    0x9309_8309, // s_mul_i32 s9, s9, 3
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+#[test]
+#[ignore = "requires scalar-state console-flow detection"]
+fn disjoint_branch_paths_update_the_same_scalar_in_order() {
+    // When both regions run, the second starts with the first one's scalar.
+    console_flow_case("both scalar updates", DISJOINT_SCALAR_UPDATES, 64, |_| 15);
+    console_flow_case("only the first update", DISJOINT_SCALAR_UPDATES, 32, |_| 5);
+}
+
+#[test]
+#[ignore = "requires scalar-state console-flow detection"]
+fn divergent_scalar_state_requires_one_console_wave_on_wave32_hosts() {
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let wave64 = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    let one = program(DISJOINT_SCALAR_UPDATES, 64);
+    assert_eq!(wave_size(&emit_for(&one, wave32).unwrap().dxil), Some(32));
+    assert_eq!(wave_size(&emit_for(&one, wave64).unwrap().dxil), Some(64));
+
+    let two = program(DISJOINT_SCALAR_UPDATES, 128);
+    let err = emit_for(&two, wave32).unwrap_err();
+    assert!(
+        err.to_string().contains("a group of more than 64 threads"),
+        "{err}"
+    );
+    assert_eq!(wave_size(&emit_for(&two, wave64).unwrap().dxil), Some(64));
+}
+
+#[test]
+fn a_uniform_scalar_join_does_not_pin_the_wave_size() {
+    let body = [
+        0xBE89_0381, // s_mov_b32 s9, 1
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0 (group id x)
+        0xBF85_0001, // s_cbranch_scc1 -> join
+        0xBE89_0382, // s_mov_b32 s9, 2
+        0x7E04_0209, // join: v_mov_b32 v2, s9
+    ];
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let shader = emit_for(&program(&body, 128), wave32).unwrap();
+    assert_eq!(wave_size(&shader.dxil), None);
+}
