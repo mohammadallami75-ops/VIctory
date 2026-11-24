@@ -86,6 +86,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
+#[cfg(all(test, windows))]
+mod mesh_wave_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
