@@ -607,10 +607,16 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         let c = self.cur;
-        let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
-            off = self.s.m.bin(c, Bin::Add, off, d);
+        let mut off = self.relative_offset(a.offset, a.dynamic)?;
+        if let Some(pick) = a.selected {
+            let Val::Bit(cond) = self.get(pick.scc)? else {
+                return Err("SCC without a value");
+            };
+            let [(set_fixed, set_dynamic), (clear_fixed, clear_dynamic)] = pick.arms;
+            let set = self.relative_offset(set_fixed, set_dynamic)?;
+            let clear = self.relative_offset(clear_fixed, clear_dynamic)?;
+            let chosen = self.s.m.select(c, cond, set, clear);
+            off = self.s.m.bin(c, Bin::Add, off, chosen);
         }
         let h = if a.param == CODE {
             None
@@ -3061,6 +3067,16 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The constant and computed terms of a relative byte offset.
+    fn relative_offset(&mut self, offset: u32, dynamic: Option<Value>) -> Result<V, Why> {
+        let fixed = self.s.m.i32(offset);
+        let Some(value) = dynamic else {
+            return Ok(fixed);
+        };
+        let value = self.i32_of(value)?;
+        Ok(self.s.m.bin(self.cur, Bin::Add, fixed, value))
     }
 
     /// `s_load_dword*` from the program's constant table.

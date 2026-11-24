@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_test_cs(body, false)
+}
+
+fn build_test_cs(body: &[u32], root_srv: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,7 +87,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    let mut native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -122,6 +126,31 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
+    if root_srv {
+        native.layout.push(RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 6,
+            slot: 2,
+        });
+        native.used.push(UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 6,
+            slot: 2,
+        });
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [1, 1, 1],
+        });
+    }
+
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -150,11 +179,17 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
     };
 
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        Err(e) if std::env::var_os("VICTORY_DXIL").is_some() => {
+            panic!("could not load configured DXIL validator: {e}");
+        }
+        Err(_) => {}
     }
 
     shader
@@ -172,6 +207,15 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_compute_cases(shader, cases, &[], check);
+}
+
+fn run_compute_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    srv: &[u32],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -193,12 +237,22 @@ fn run_cases(
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
+            let mut roots = vec![(0, Root::Constants(ud))];
+            if !srv.is_empty() {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: srv.to_vec(),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots,
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -210,6 +264,32 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn global_load_through_a_scalar_selected_root_srv_address() {
+    let shader = build_test_cs(
+        &[
+            sop2(0x00, 12, 6, 1),    // s_add_u32 s12, s6, s1
+            sop2(0x04, 13, 7, 0x80), // s_addc_u32 s13, s7, 0
+            sop2(0x00, 14, 6, 2),    // s_add_u32 s14, s6, s2
+            sop2(0x04, 15, 7, 0x80), // s_addc_u32 s15, s7, 0
+            0xBF06_8000,             // s_cmp_eq_u32 s0, 0
+            sop2(0x0B, 16, 12, 14),  // s_cselect_b64 s[16:17], s[12:13], s[14:15]
+            0xBF06_8080,             // s_cmp_eq_u32 0, 0 (overwrites SCC)
+            0xDC32_8004,
+            0x0010_0004, // global_load_dword v0, v4, s[16:17] offset:4
+        ],
+        true,
+    );
+    assert_eq!(shader.root_srvs, [2]);
+    let src: Vec<u32> = (0..16).map(|i| 0x9100_0000 | (i * 0x0001_0101)).collect();
+    let cases = [[0, 4, 24, 0], [1, 4, 24, 0], [0, 28, 4, 8], [1, 28, 4, 8]];
+    run_compute_cases(&shader, &cases, &src, |backend, i, _, got| {
+        let expected = [0x9102_0202, 0x9107_0707, 0x910a_0a0a, 0x9104_0404][i];
+        assert_eq!(got, expected, "{backend} case {i}");
+        eprintln!("{backend} case {i}: {got:#010x}");
+    });
 }
 
 fn is_f16_nan(bits: u16) -> bool {
