@@ -497,8 +497,14 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            console_lanes = reads_whole || masks_held || insts().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
+            // Scalar detection can request console flow. If that lowering
+            // declines the program, try the original per-lane requirements.
+            let scalar_console_flow = x.st.divergent_scalar_joins
+                && !x.per_lane_only
+                && (x.target.runs(wave) || x.target.runs(32));
+            console_lanes =
+                scalar_console_flow || reads_whole || masks_held || insts().any(in_half);
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
@@ -511,6 +517,7 @@ impl<'a> Lower<'a> {
             // flow below.)
             split = console_lanes
                 && x.native.wave64
+                && !scalar_console_flow
                 && !reads_whole
                 && !insts().any(|i| i.name() == "v_readfirstlane_b32")
                 && !masks_held
@@ -596,7 +603,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
-            wants_console_flow |= x.target.runs(wave) && reads_mask_data;
+            wants_console_flow |= scalar_console_flow || x.target.runs(wave) && reads_mask_data;
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
