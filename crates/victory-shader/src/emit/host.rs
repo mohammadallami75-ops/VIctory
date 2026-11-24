@@ -524,6 +524,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         },
         dxil: s.finish(),
         user_data: Vec::new(),
+        static_view_tables: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),

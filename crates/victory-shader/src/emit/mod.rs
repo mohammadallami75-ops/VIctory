@@ -145,6 +145,9 @@ pub struct HostShader {
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
     pub user_data: Vec<UserData>,
+    /// Root slot and lowest descriptor index read by shaders whose accesses
+    /// to that view table all use statically known offsets.
+    pub static_view_tables: Vec<(u8, u32)>,
     /// Immediate samplers: the four sampler words of `s<n>`.
     pub samplers: Vec<[u32; 4]>,
     /// The same samplers decoded, `s<n>` at position n: the static sampler
@@ -293,6 +296,7 @@ pub fn emit(
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
+        static_view_tables: l.static_view_tables,
         static_samplers: l
             .samplers
             .iter()
@@ -561,6 +565,7 @@ mod tests {
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
+            static_view_tables: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
@@ -571,6 +576,7 @@ mod tests {
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
+                static_view_tables: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
