@@ -31,6 +31,15 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// Additional byte offset selected by SCC for a global load.
+    pub selected: Option<SelectedOffset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedOffset {
+    pub scc: Value,
+    /// Constant and dynamic offset for SCC set, then for SCC clear.
+    pub arms: [(u32, Option<Value>); 2],
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -279,6 +288,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -604,14 +614,14 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.global_address(lo, hi, extra)
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
-                self.address(
+                self.global_address(
                     lo,
                     hi,
                     Sum {
@@ -622,6 +632,76 @@ impl<'a> Tracer<'a> {
                 )
             }
         }
+    }
+
+    fn global_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        self.address(lo, hi, extra)
+            .or_else(|why| self.selected_address(lo, hi, extra).ok_or(why))
+    }
+
+    /// Resolve the two halves under the same SCC. Both outcomes must reduce
+    /// to the same root descriptor so the host can bind one view.
+    fn selected_address(&self, lo: Term, hi: Term, extra: Sum) -> Option<Address> {
+        let Term::Value(lo) = lo else { return None };
+        let (scc, set_lo, clear_lo) = self.picked(lo)?;
+        let (set_hi, clear_hi) = match hi {
+            Term::Value(v) if let Some((cond, set, clear)) = self.picked(v) => {
+                if cond != scc {
+                    return None;
+                }
+                (set, clear)
+            }
+            _ => (hi, hi),
+        };
+        let set = self.selected_arm(set_lo, set_hi)?;
+        let clear = self.selected_arm(clear_lo, clear_hi)?;
+        (set.param == clear.param).then_some(Address {
+            param: set.param,
+            offset: extra.offset,
+            dynamic: extra.dynamic,
+            selected: Some(SelectedOffset {
+                scc,
+                arms: [(set.offset, set.dynamic), (clear.offset, clear.dynamic)],
+            }),
+        })
+    }
+
+    /// A direct root view or one unsigned low add paired with its own carry.
+    fn selected_arm(&self, lo: Term, hi: Term) -> Option<Address> {
+        let (Term::Value(low), Term::Value(high)) = (lo, hi) else {
+            return None;
+        };
+        let sum = self.sum(lo);
+        let base = sum.base?;
+        let (param, 0) = self.param_of(self.inputs[base.0 as usize]?)? else {
+            return None;
+        };
+        if self.layout[param].root != RootType::Descriptor {
+            return None;
+        }
+        let root_high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+        let want = Term::Value(self.p.inputs.iter().find(|i| i.0 == root_high)?.1);
+        if low == base {
+            if hi != want {
+                return None;
+            }
+        } else {
+            let (add, terms) = self.sop2(low, &["s_add_u32"])?;
+            let (addc, [a, b]) = self.sop2(high, &["s_addc_u32"])?;
+            let carry = add.write(Reg::Scc)?;
+            if !terms.contains(&Term::Value(base))
+                || !((a == want && b == Term::Const(0)) || (b == want && a == Term::Const(0)))
+                || addc.read(Reg::Scc) != Some(carry)
+            {
+                return None;
+            }
+        }
+        Some(Address {
+            param,
+            offset: sum.offset,
+            dynamic: sum.dynamic,
+            selected: None,
+        })
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
@@ -644,6 +724,7 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                selected: None,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -671,6 +752,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            selected: None,
         })
     }
 
@@ -1213,7 +1295,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.selected) != (a0.param, a0.dynamic, a0.selected)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
@@ -1761,6 +1843,51 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            selected: None,
+        }
+    }
+
+    #[test]
+    fn selected_global_address_requires_one_root_and_matching_carry() {
+        let layout = [
+            param(Constants, 0, 1),
+            param(Descriptor, 4, 2),
+            param(Descriptor, 6, 2),
+        ];
+        let different_roots = [
+            0xBE88_0404, // s_mov_b64 s[8:9], s[4:5]
+            0xBE8A_0406, // s_mov_b64 s[10:11], s[6:7]
+        ];
+        let unrelated_carry = [
+            0x8008_8404, // s_add_u32 s8, s4, 4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (overwrites SCC)
+            0x8209_8005, // s_addc_u32 s9, s5, 0
+            0xBE8A_0404, // s_mov_b64 s[10:11], s[4:5]
+        ];
+        for (name, arms) in [
+            ("different roots", different_roots.as_slice()),
+            ("unrelated carry", unrelated_carry.as_slice()),
+        ] {
+            let tail = [
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0x858C_0A08, // s_cselect_b64 s[12:13], s[8:9], s[10:11]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC32_8000,
+                0x010C_0000, // global_load_dword v1, v0, s[12:13]
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = arms
+                .iter()
+                .copied()
+                .chain(tail)
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let p = crate::ir::build(&code, false, 8).unwrap();
+            let result = track(&p, &layout, HwStage::Cs, None);
+            assert!(
+                matches!(result, Err(ShaderError::Unsupported { offset, .. }) if offset == (arms.len() + 3) * 4),
+                "{name}: {result:?}"
+            );
         }
     }
 
