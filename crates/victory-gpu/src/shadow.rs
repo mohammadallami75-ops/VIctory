@@ -94,6 +94,14 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// Whether the whole title memory range lies in this copy.
+    pub(crate) fn covers(&self, address: u64, len: u64) -> bool {
+        address >= self.start
+            && address
+                .checked_add(len)
+                .is_some_and(|end| end <= self.start + self.len)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start

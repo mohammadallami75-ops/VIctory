@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::descriptor::View;
+use crate::descriptor::{View, host::HostHeap};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -630,7 +630,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            readable(list, u, &view, host, index);
         }
     }
 
@@ -717,7 +717,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, host, first + u.table_offset_dwords / 8);
                     }
                 }
                 made.push((slot, first * 32));
@@ -752,7 +752,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, host, index);
                         }
                     }
                     None => {
@@ -1102,16 +1102,19 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+fn readable(list: &HostList, u: &UsedResource, view: &View, heap: &HostHeap, index: u32) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
+    // Use the copy bound to the slot: looking up just the view's bytes can
+    // find a different copy when title buffer allocations overlap.
     if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
+        && let Some(shadow) = heap.buffer_shadow(index)
+        && shadow.covers(address, len)
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
@@ -1214,4 +1217,66 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shadow::{find, register, unregister};
+
+    #[test]
+    fn overlapping_buffer_uav_copies_back_from_the_descriptor_shadow() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = HostHeap::new(false, 4).expect("host view heap");
+        let slot = heap.dynamic(1).expect("descriptor slot");
+        let mut title = [0x22u32; 16];
+        let base = title.as_mut_ptr() as u64;
+        let address = base + 16;
+        register(1, base, 64);
+        register(2, address, 16);
+        let bound = find(base, 64).expect("outer host copy");
+        let inner = find(address, 4).expect("inner host copy");
+        assert!(!std::sync::Arc::ptr_eq(&bound, &inner));
+
+        let mut resource = [0; 14];
+        resource[0] = 1; // Buffer
+        resource[4] = 64; // Width
+        let mut desc = [0; 16];
+        desc[0] = 42; // DXGI_FORMAT_R32_UINT
+        desc[1] = 1; // D3D12_UAV_DIMENSION_BUFFER
+        desc[2] = 4; // FirstElement
+        desc[4] = 1; // NumElements
+        desc[10] = base as u32;
+        desc[11] = (base >> 32) as u32;
+        let view = View::Placed(true, resource, desc);
+        heap.make_at(slot, &view);
+        let descriptor_shadow = heap.buffer_shadow(slot).expect("bound UAV host copy");
+        assert!(std::sync::Arc::ptr_eq(&bound, &descriptor_shadow));
+        let used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let list = host.new_list().expect("host command list");
+        readable(&list, &used, &view, &heap, slot);
+        let (upload, data) = host.upload_buffer(4).expect("upload source");
+        // SAFETY: the upload's four mapped bytes and the destination word
+        // in the descriptor's host copy are live through submission.
+        unsafe {
+            data.cast::<u32>().write_unaligned(0x7040_2010);
+            list.list.CopyBufferRegion(&bound.buffer, 16, &upload, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+        unregister(2, address);
+        unregister(1, base);
+        assert_eq!(&title[3..6], &[0x22, 0x7040_2010, 0x22]);
+    }
 }
