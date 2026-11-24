@@ -5,13 +5,14 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -29,7 +30,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: Mutex<Vec<Option<KeptResource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -299,10 +300,19 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    fn keep(&self, index: u32, resource: Option<KeptResource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             *slot = resource;
+        }
+    }
+
+    /// The host copy actually named by this slot's buffer descriptor.
+    pub(crate) fn buffer_shadow(&self, index: u32) -> Option<Arc<Shadow>> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        match kept.get(index as usize)? {
+            Some(KeptResource::Buffer(shadow)) => Some(shadow.clone()),
+            _ => None,
         }
     }
 
@@ -390,7 +400,10 @@ impl HostHeap {
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+            let host = self
+                .buffer_shadow(index)
+                .filter(|shadow| shadow.covers(address, len))
+                .map(|shadow| shadow.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
@@ -493,8 +506,14 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+/// The object a slot made by [`make`] must keep alive.
+#[derive(Clone)]
+enum KeptResource {
+    Resource { _resource: ID3D12Resource },
+    Buffer(Arc<Shadow>),
+}
+
+type Kept = Option<KeptResource>;
 
 fn buffer_srv(
     address: u64,
@@ -522,14 +541,12 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(KeptResource::Buffer(shadow)))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
-/// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
-/// written by shaders (upload memory).
-/// shortcut: what shaders write stays in the host copy; title memory (and
-/// so the CPU, and copies run on the CPU) does not see it.
+/// bytes) on its host copy, as [`buffer_srv`]. The copy must support writes
+/// from shaders.
 fn buffer_uav(
     address: u64,
     len: u64,
@@ -565,7 +582,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(KeptResource::Buffer(shadow)))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -643,7 +660,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(KeptResource::Resource {
+                _resource: shadow.buffer.clone(),
+            }))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -660,7 +679,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Some(KeptResource::Resource {
+                    _resource: texture.clone(),
+                }))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -692,7 +713,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some(KeptResource::Resource {
+                _resource: texture.clone(),
+            }))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
