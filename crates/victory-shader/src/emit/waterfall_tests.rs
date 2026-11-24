@@ -78,6 +78,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_view_tables: lowered.static_view_tables,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,

@@ -210,6 +210,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.static_view_tables.len() as u32);
+    for &(slot, first) in &s.static_view_tables {
+        out.push(slot);
+        word(&mut out, first);
+    }
     out
 }
 
@@ -266,10 +271,19 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    // Older cached shaders bind the full table until retranslated.
+    let mut static_view_tables = Vec::new();
+    if !r.0.is_empty() {
+        let n = r.word()? as usize;
+        for _ in 0..n {
+            static_view_tables.push((r.take(1)?[0], r.word()?));
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
         user_data,
+        static_view_tables,
         samplers,
         static_samplers,
         root_cbvs,
@@ -291,6 +305,7 @@ mod tests {
                 root: RootType::Table,
                 dword: 0,
             }],
+            static_view_tables: vec![(1, 64)],
             samplers: vec![[0x400, 0xc0_0000, 0x18f0_0000, 0]],
             static_samplers: vec![StaticSampler::from_words([
                 0x400,

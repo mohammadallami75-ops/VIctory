@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -76,7 +76,7 @@ impl Heap {
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
-    pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+    pub(crate) fn host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -94,7 +94,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
             .as_ref()
     }
@@ -145,19 +145,6 @@ fn mirror(handle: u64) {
                 host.mirror(index, handle, false);
             }
         }
-    }
-}
-
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
     }
 }
 
@@ -417,10 +404,16 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    view_record(unsafe { (handle as *const [u32; 3]).read_unaligned() })
+}
+
+pub(crate) fn view_record([tag, i, generation]: [u32; 3]) -> Option<View> {
+    if tag != VIEW_TAG {
+        return None;
+    }
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (*current == generation).then(|| view.clone())
 }
 
 /// A description of `N` words, if the title passes one.
@@ -667,7 +660,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -679,6 +672,23 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn view_heap(count: u32) -> This {
+        let mut heap = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address: 0,
+            size: 0,
+        };
+        assert_eq!(create(desc, placement, &mut heap), S_OK);
+        heap
     }
 
     #[test]

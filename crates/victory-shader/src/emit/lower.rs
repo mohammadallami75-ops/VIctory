@@ -36,6 +36,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
+    pub static_view_tables: Vec<(u8, u32)>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
@@ -168,6 +169,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    view_table_starts: BTreeMap<u8, Option<u32>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -468,6 +470,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            view_table_starts: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -912,6 +915,11 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
+            static_view_tables: self
+                .view_table_starts
+                .into_iter()
+                .filter_map(|(slot, first)| Some((slot, first?)))
+                .collect(),
             samplers: self.samplers,
         })
     }
@@ -3489,8 +3497,13 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        match self.x.native.layout.get(a.param) {
+            Some(p) if p.root == RootType::Table => {
+                if !sampler {
+                    self.view_table_starts.insert(p.slot, None);
+                }
+            }
+            Some(p) if matches!(p.root, RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
@@ -3529,8 +3542,25 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        match self.x.native.layout.get(a.param) {
+            Some(p) if p.root == RootType::Table => {
+                if !sampler {
+                    let entry =
+                        if a.dynamic.is_none() && !self.x.res.waterfall.loads.contains(&load) {
+                            a.offset
+                                .checked_add(4 * u32::from(first))
+                                .filter(|&bytes| i32::try_from(bytes).is_ok())
+                                .map(|bytes| bytes / 32)
+                        } else {
+                            None
+                        };
+                    self.view_table_starts
+                        .entry(p.slot)
+                        .and_modify(|start| *start = start.zip(entry).map(|(a, b)| a.min(b)))
+                        .or_insert(entry);
+                }
+            }
+            Some(p) if matches!(p.root, RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
@@ -7171,9 +7201,9 @@ mod tests {
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xFA00_1000, // s_load_dwordx4 s[8:11], s[4:5], 0x1000
             0xF408_0302,
-            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xFA00_1010, // s_load_dwordx4 s[12:15], s[4:5], 0x1010
             0xBF06_8001, // s_cmp_eq_u32 s1, 0
             0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
             0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
@@ -7189,7 +7219,7 @@ mod tests {
             vec![UsedResource {
                 kind: ResourceType::Srv,
                 root: RootType::Table,
-                table_offset_dwords: 0,
+                table_offset_dwords: 0x1000 / 4,
                 lower_bound: 0,
                 stride: 4,
                 dwords: 4,
@@ -7197,7 +7227,8 @@ mod tests {
                 slot: 0,
             }]
         };
-        lower_with(&words, layout(), used()).unwrap();
+        let lowered = lower_with(&words, layout(), used()).unwrap();
+        assert_eq!(lowered.static_view_tables, vec![(0, 128)]);
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
@@ -7226,10 +7257,10 @@ mod tests {
         use crate::resource::tests::{
             WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
         };
-        for (words, wave64) in [
-            (WATERFALL_FETCHED_WAVE32, false),
-            (WATERFALL_FETCHED_WAVE64, true),
-            (WATERFALL_PICKED_WAVE32, false),
+        for (words, wave64, static_views) in [
+            (WATERFALL_FETCHED_WAVE32, false, &[][..]),
+            (WATERFALL_FETCHED_WAVE64, true, &[][..]),
+            (WATERFALL_PICKED_WAVE32, false, &[(0, 0)][..]),
         ] {
             let (layout, used) = texture_tables();
             let l = lower_wave(words, layout, used, wave64).unwrap();
@@ -7237,6 +7268,7 @@ mod tests {
             // dwords: no wave operation is left.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+            assert_eq!(l.static_view_tables, static_views);
         }
     }
 

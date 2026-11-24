@@ -8,11 +8,12 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::descriptor::View;
+use crate::descriptor::{View, host::HostHeap};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -51,6 +52,18 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct FreshTable {
+    heap: usize,
+    start: u64,
+    records: Vec<[u32; 3]>,
+}
+
+/// The shader adds its original table offset to this base modulo 2^32.
+fn table_base(first: u32, skip: u32) -> u32 {
+    first.wrapping_sub(skip).wrapping_mul(32)
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -71,20 +84,18 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Table snapshots made in this list, mapped to their first host slot.
+    fresh_tables: std::collections::HashMap<FreshTable, u32>,
+    /// The owning host heap, first slot and count for each allocation.
+    dynamic: Vec<(Arc<HostHeap>, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, first, n) in &self.dynamic {
+            heap.release(*first, *n);
         }
     }
 }
@@ -459,7 +470,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.static_view_tables, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -645,7 +656,13 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        static_view_tables: &[(u8, u32)],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -697,21 +714,39 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
+            let (begin, end) = entries
                 .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
+                .map(|u| u.table_offset_dwords / 8)
+                .fold((u32::MAX, 0), |(first, last), k| {
+                    (first.min(k), last.max(k))
+                });
+            let skip = static_view_tables
+                .iter()
+                .find(|&&(root, _)| root == slot)
+                .map_or(0, |&(_, first)| first.min(begin));
+            let n = end - skip + 1;
+            let Some(last) = table.checked_add(u64::from(end) * 32) else {
+                self.table_failed = true;
+                continue;
+            };
+            if heap.samplers()
+                || !(table - heap.start).is_multiple_of(32)
+                || heap.index(last).is_none()
+            {
+                self.table_failed = true;
+                continue;
+            }
+            let start = table + u64::from(skip) * 32;
+            let key = FreshTable {
+                heap: Arc::as_ptr(host) as usize,
+                start,
+                records: (skip..=end)
+                    .map(|k| {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: the aligned span lies within the bound view heap.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }
+                    })
+                    .collect(),
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -720,7 +755,7 @@ impl State {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, table_base(first, skip)));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -732,15 +767,13 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            self.dynamic.push((Arc::clone(host), first, n));
+            // Preserve holes and the original offsets between entries.
+            for (offset, &record) in key.records.iter().enumerate() {
+                let index = first + offset as u32;
+                let k = skip + offset as u32;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match crate::descriptor::view_record(record) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -763,7 +796,8 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            self.fresh_tables.insert(key, first);
+            made.push((slot, table_base(first, skip)));
         }
         made
     }
@@ -1214,4 +1248,157 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor::{create_cbv, heap, tests::view_heap};
+    use crate::host::{host, transition};
+    use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    use windows::core::s;
+
+    #[test]
+    fn compact_descriptor_table_survives_exhaustion_and_dispatches() {
+        let Some(host) = host() else {
+            return;
+        };
+        let guest = view_heap(1_000_001);
+        let table = heap(guest).start;
+        let native = Arc::clone(heap(guest).host().unwrap());
+        // SAFETY: queries on live objects.
+        let total = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let name = String::from_utf16_lossy(&desc.Description);
+            let slots = native.heap.GetDesc().NumDescriptors;
+            println!(
+                "{}: {slots} host slots, {} dynamic",
+                name.trim_end_matches('\0'),
+                slots - native.count()
+            );
+            slots
+        };
+        let reserve = total - native.count() - 2;
+        let reserved = native.dynamic(reserve).unwrap();
+        let input = [[0x1234u32, 0, 0, 0], [0x5678, 0, 0, 0]];
+        let used = [128, 129].map(|i| UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: i * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        });
+        for (i, data) in input.iter().enumerate() {
+            let address = data.as_ptr() as u64;
+            create_cbv(
+                std::ptr::null(),
+                &[address as u32, (address >> 32) as u32, 16, 0],
+                table + (128 + i as u64) * 32,
+            );
+        }
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.heaps[0] = guest as usize;
+        state.set_table(true, 0, table);
+
+        assert!(state.tables(&list, &used, &[], true).is_empty());
+        assert!(state.table_failed);
+        state.table_failed = false;
+        let bindings = state.tables(&list, &used, &[(0, 128)], true);
+        assert!(!state.table_failed);
+        assert_eq!(state.tables(&list, &used, &[(0, 128)], true), bindings);
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(native.dynamic(1), None);
+        let first = bindings[0].1.wrapping_add(128 * 32) >> 5;
+        assert_eq!(first, total - 2);
+        assert_eq!(table_base(3, 128).wrapping_add(129 * 32) >> 5, 4);
+
+        const SOURCE: &str = r#"
+            cbuffer A : register(b0) { uint a; };
+            cbuffer B : register(b1) { uint b; };
+            RWByteAddressBuffer result : register(u0);
+            [RootSignature("DescriptorTable(CBV(b0, numDescriptors=2)), UAV(u0)")]
+            [numthreads(1, 1, 1)]
+            void main() { result.Store2(0, uint2(a, b)); }
+        "#;
+        let (output, data) = host.shared_buffer(8).unwrap();
+        // SAFETY: live shader source, D3D12 objects and mapped output.
+        unsafe {
+            let mut shader: Option<ID3DBlob> = None;
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("compact table"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut shader,
+                None,
+            )
+            .unwrap();
+            let shader = shader.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                shader.GetBufferPointer().cast::<u8>(),
+                shader.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut handle = native.heap.GetGPUDescriptorHandleForHeapStart();
+            handle.ptr += u64::from(first)
+                * u64::from(
+                    host.device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                );
+            list.list.SetDescriptorHeaps(&[Some(native.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, handle);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+            list.list.ResourceBarrier(&[transition(
+                &output,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            list.list.Dispatch(1, 1, 1);
+            list.close();
+            let retained = Arc::downgrade(&native);
+            drop(native);
+            crate::object::slot::<extern "system" fn(This) -> u32>(guest, 0x10)(guest);
+            assert_eq!(retained.strong_count(), 1);
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            assert_eq!(
+                data.cast::<[u32; 2]>().read_unaligned(),
+                [input[0][0], input[1][0]]
+            );
+            let native = retained.upgrade().unwrap();
+            state.reset(std::ptr::null());
+            assert_eq!(native.dynamic(2), Some(first));
+            native.release(reserved, reserve);
+        }
+    }
 }
