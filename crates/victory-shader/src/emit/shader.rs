@@ -74,6 +74,7 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    pub extra_shared_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -141,6 +142,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            extra_shared_dwords: 0,
             lds: None,
             main,
             entry,
@@ -624,7 +626,9 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self
+                .mesh
+                .map(|m| (m, (self.lds_dwords + self.extra_shared_dwords) * 4)),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
