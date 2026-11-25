@@ -1472,6 +1472,11 @@ fn per_lane_scalar_case(body: &[u32], want: impl Fn(u32, u32) -> u32) {
     for group in 0..groups {
         expected.extend((0..threads).map(|lane| want(group, lane)));
     }
+    // Share the GPU test lock with the VALU and waterfall fixtures, since
+    // concurrent WARP dispatches can crash the test process.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for name in adapters().unwrap_or_default() {
         if let Ok(host) = Host::on(&name) {
             assert_eq!(run(&host, &shader, groups).unwrap(), expected, "{name}");
