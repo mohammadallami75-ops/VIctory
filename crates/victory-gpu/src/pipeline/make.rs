@@ -59,7 +59,7 @@ impl Pending {
         }
     }
 
-    fn make(&self) {
+    pub(super) fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;

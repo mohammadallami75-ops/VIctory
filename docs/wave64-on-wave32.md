@@ -192,10 +192,11 @@ by a wave64 group of a multiple of 64 threads with no LDS and no
 `s_barrier`. The emitted shader says its k (`HostShader::group_waves`,
 kept in the shader cache); `victory-gpu` multiplies a direct dispatch's x
 and drops the dispatch if that passes D3D12's 65535 groups per dimension.
-Open: indirect dispatches of such a shader are dropped until the records'
-x is multiplied on the GPU. The clamp pass rewrites the records in place,
-so a multiplication there has to be undone after the execution, or a
-record executed twice would be multiplied twice.
+For k > 1, an indirect dispatch bounds and scales the records on the GPU
+in a list-owned buffer, with the effective count beside them. The title's
+arguments and count stay available to later GPU writers. Dispatches at
+k = 1 use the ordinary in-place clamp. The per-record cap is 2^20 host
+groups, which allows at most floor(2^20 / k) console groups.
 
 **With LDS and `s_barrier`:** the waves of a group do meet there, so they
 must stay one host group. Open; candidates are group barriers where every
@@ -256,9 +257,9 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
    console flow).~~
-7. ~~Multi-wave groups without LDS: one console wave per host group (the
-   translator's ids and direct dispatch counts).~~ Indirect dispatch
-   counts are open.
+7. ~~Multi-wave groups without LDS: one console wave per host group.~~
+   Direct dispatch scales X on the CPU. Indirect dispatch scales X and
+   applies host work limits on the GPU in a list-owned argument buffer.
 8. Multi-wave groups with LDS.
 
 ## Credit

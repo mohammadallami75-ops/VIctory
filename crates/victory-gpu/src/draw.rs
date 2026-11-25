@@ -1013,8 +1013,16 @@ impl State {
             },
             None => None,
         };
+        // A ready multi-wave pipeline needs packed, scaled arguments.
+        // Otherwise keep the original clamp-before-prepare order.
+        let pipeline = self.pipeline as This;
+        let compute = || crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        let dispatch = (kind == DISPATCH).then(compute).flatten();
+        let waves = dispatch.map_or(1, group_waves);
+        let rewrite = waves > 1;
+        let host_stride = if rewrite { 12 } else { stride };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(kind, host_stride))
             .flatten()
         else {
             why("no host signature");
@@ -1024,27 +1032,45 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        if kind == DISPATCH && max == 0 {
+            return true;
         }
+        // Both argument passes replace the currently bound compute pipeline.
+        let rewritten;
+        let (host_args, host_offset) = if rewrite {
+            let Some(buffer) = crate::indirect::dispatch(
+                list,
+                args.gpu(arguments),
+                counter.as_ref().map(|(s, at)| s.gpu(*at)),
+                (stride, max, waves),
+            ) else {
+                why("dispatch arguments could not be rewritten");
+                return false;
+            };
+            rewritten = buffer;
+            (&rewritten, 0)
+        } else {
+            if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max))
+            {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            }
+            (&args.buffer, args.offset(arguments))
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                // shortcut: a shader emitted as one console wave per host
-                // group needs the records' x multiplied on the GPU; until
-                // the clamp does that, its indirect dispatches are dropped.
-                Some(p) if p.compute && group_waves(p) == 1 => self.bind(list, p, true),
-                _ => false,
-            },
+            // A pipeline may become ready during the clamp. It can use
+            // these arguments only if their wave count matches.
+            DISPATCH => dispatch
+                .or_else(compute)
+                .is_some_and(|p| group_waves(p) == waves && self.bind(list, p, true)),
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, host_args);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1056,19 +1082,27 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
+        let (host_count, count_offset) = if rewrite {
+            (Some(host_args), u64::from(max) * 12)
+        } else {
+            (
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        // SAFETY: the list is open and keeps the buffers alive. The packed
+        // count shares the rewritten buffer; ordinary counts use the base path.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &signature,
+                max,
+                host_args,
+                host_offset,
+                host_count,
+                count_offset,
+            );
+        };
+        crate::indirect::done(list, host_args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
